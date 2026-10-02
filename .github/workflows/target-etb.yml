@@ -1,1 +1,165 @@
+name: Target 30th ETB Alert
+
+on:
+  schedule:
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: Send test notification
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: target-30th-etb-stock
+  cancel-in-progress: false
+
+jobs:
+  stock-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install parser
+        run: python3 -m pip install --quiet beautifulsoup4
+      - name: Check Target
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SEND_TEST: ${{ inputs.send_test }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          from bs4 import BeautifulSoup
+
+          URL = 'https://www.target.com/p/-/A-1010892076'
+          PRODUCT = '30th Celebration Elite Trainer Box'
+          topic = os.environ.get('NTFY_TOPIC', '').strip()
+          state = Path('stock_state.txt')
+
+          if not re.fullmatch(r'[A-Za-z0-9_-]{12,64}', topic):
+              raise SystemExit('Configure NTFY_TOPIC secret first.')
+
+          def notify(title, message):
+              req = Request(
+                  'https://ntfy.sh/' + topic,
+                  data=message.encode(),
+                  method='POST',
+                  headers={
+                      'Title': title,
+                      'Priority': 'high',
+                      'Click': URL,
+                  })
+              with urlopen(req, timeout=20) as response:
+                  if response.status not in (200, 201, 202):
+                      raise RuntimeError('Notification delivery failed')
+
+          if os.environ.get('SEND_TEST', '').lower() == 'true':
+              notify('Target ETB test successful',
+                     'Your iPhone alert is connected. This is a test.')
+              print('Test notification sent')
+              raise SystemExit(0)
+
+          def walk(value):
+              if isinstance(value, dict):
+                  yield value
+                  for item in value.values():
+                      yield from walk(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      yield from walk(item)
+
+          def check():
+              request = Request(URL, headers={
+                  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+                  'Accept': 'text/html,application/xhtml+xml',
+                  'Accept-Language': 'en-US,en;q=0.9',
+              })
+              try:
+                  with urlopen(request, timeout=20) as response:
+                      html = response.read(3000000).decode(
+                          'utf-8', errors='replace')
+              except Exception as error:
+                  print('Target unavailable:', error)
+                  return 'unknown'
+
+              soup = BeautifulSoup(html, 'html.parser')
+              for tag in soup.select('script[type="application/ld+json"]'):
+                  try:
+                      data = json.loads(tag.string or tag.get_text())
+                  except (TypeError, ValueError):
+                      continue
+                  for item in walk(data):
+                      kind = item.get('@type', [])
+                      if isinstance(kind, str):
+                          kind = [kind]
+                      if ('Product' not in kind or
+                          PRODUCT.lower() not in
+                          str(item.get('name', '')).lower()):
+                          continue
+                      offers = item.get('offers', [])
+                      if isinstance(offers, dict):
+                          offers = [offers]
+                      for offer in offers:
+                          if not isinstance(offer, dict):
+                              continue
+                          availability = str(
+                              offer.get('availability', '')).lower()
+                          if availability.endswith('/instock'):
+                              return 'in_stock'
+                          if availability.endswith('/outofstock'):
+                              return 'out_of_stock'
+
+              heading = soup.find('h1')
+              if not heading or PRODUCT.lower() not in heading.get_text(
+                      ' ', strip=True).lower():
+                  print('Product details could not be verified')
+                  return 'unknown'
+              main = heading.find_parent('main') or soup
+              content = main.get_text(' ', strip=True)
+              position = content.lower().find(PRODUCT.lower())
+              nearby = content[max(0, position):max(0, position)+1000]
+              price = re.search(
+                  r'\$\s*\d{1,3}(?:,\d{3})*\.\d{2}', nearby)
+              if price:
+                  after = nearby[price.end():price.end()+260]
+                  if re.search(r'out of stock|sold out', after, re.I):
+                      return 'out_of_stock'
+                  if (re.search(r'add to cart', after, re.I) and
+                      not re.search(
+                          r'find alternative|similar items', after, re.I)):
+                      return 'in_stock'
+              return 'unknown'
+
+          previous = state.read_text().strip() if state.exists() else 'unknown'
+          current = check()
+          print('Previous:', previous, 'Current:', current)
+          if current == 'unknown':
+              print('No verified inventory data. No alert.')
+              raise SystemExit(0)
+          if current == 'in_stock' and previous != 'in_stock':
+              notify('Target 30th ETB may be IN STOCK!',
+                     'Target appears to have the ETB. Tap to check now.')
+              print('Restock alert sent')
+          if current != previous:
+              state.write_text(current + '\n')
+          PY
+      - name: Save availability
+        run: |
+          if [ -f stock_state.txt ]; then
+            git add stock_state.txt
+            if ! git diff --cached --quiet; then
+              git config user.name 'github-actions[bot]'
+              git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+              git commit -m 'Update ETB stock [skip ci]'
+              git push
+            fi
+          fi
 
